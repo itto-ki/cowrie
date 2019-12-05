@@ -11,7 +11,7 @@ from twisted.internet import defer
 from twisted.python import log
 
 import cowrie.core.output
-from cowrie.core.config import CONFIG
+from cowrie.core.config import CowrieConfig
 
 
 class ReconnectingConnectionPool(adbapi.ConnectionPool):
@@ -33,8 +33,8 @@ class ReconnectingConnectionPool(adbapi.ConnectionPool):
                 self, interaction, *args, **kw)
         except MySQLdb.OperationalError as e:
             if e[0] not in (2003, 2006, 2013):
-                log.msg("RCP: got error {0}, retrying operation".format(e))
                 raise e
+            log.msg("RCP: got error {0}, retrying operation".format(e))
             conn = self.connections.get(self.threadID())
             self.disconnect(conn)
             # Try the interaction again
@@ -43,32 +43,27 @@ class ReconnectingConnectionPool(adbapi.ConnectionPool):
 
 
 class Output(cowrie.core.output.Output):
+    """
+    mysql output
+    """
     db = None
 
-    def __init__(self):
-        try:
-            self.debug = CONFIG.getboolean('output_mysql', 'debug')
-        except Exception:
-            self.debug = False
-
-        cowrie.core.output.Output.__init__(self)
-
     def start(self):
-        try:
-            port = CONFIG.getint('output_mysql', 'port')
-        except Exception:
-            port = 3306
-
+        self.debug = CowrieConfig().getboolean('output_mysql', 'debug', fallback=False)
+        port = CowrieConfig().getint('output_mysql', 'port', fallback=3306)
         try:
             self.db = ReconnectingConnectionPool(
                 'MySQLdb',
-                host=CONFIG.get('output_mysql', 'host'),
-                db=CONFIG.get('output_mysql', 'database'),
-                user=CONFIG.get('output_mysql', 'username'),
-                passwd=CONFIG.get('output_mysql', 'password', raw=True),
+                host=CowrieConfig().get('output_mysql', 'host'),
+                db=CowrieConfig().get('output_mysql', 'database'),
+                user=CowrieConfig().get('output_mysql', 'username'),
+                passwd=CowrieConfig().get('output_mysql', 'password', raw=True),
                 port=port,
                 cp_min=1,
-                cp_max=1
+                cp_max=1,
+                charset='utf8mb4',
+                cp_reconnect=True,
+                use_unicode=True
             )
         except MySQLdb.Error as e:
             log.msg("output_mysql: Error %d: %s" % (e.args[0], e.args[1]))
@@ -77,7 +72,15 @@ class Output(cowrie.core.output.Output):
         self.db.close()
 
     def sqlerror(self, error):
-        log.err('output_mysql: MySQL Error: {}'.format(error.value))
+        """
+        1146, "Table '...' doesn't exist"
+        1406, "Data too long for column '...' at row ..."
+        """
+        if error.value[0] in (1146, 1406):
+            log.msg("output_mysql: MySQL Error: {}".format(error.value))
+            log.msg("MySQL schema maybe misconfigured, doublecheck database!")
+        else:
+            log.err("output_mysql: MySQL Error: {}".format(error.value))
 
     def simpleQuery(self, sql, args):
         """
@@ -204,3 +207,15 @@ class Output(cowrie.core.output.Output):
                 'INSERT INTO `keyfingerprints` (`session`, `username`, `fingerprint`) '
                 'VALUES (%s, %s, %s)',
                 (entry["session"], entry["username"], entry["fingerprint"]))
+
+        elif entry["eventid"] == 'cowrie.direct-tcpip.request':
+            self.simpleQuery(
+                'INSERT INTO `ipforwards` (`session`, `timestamp`, `dst_ip`, `dst_port`) '
+                'VALUES (%s, FROM_UNIXTIME(%s), %s, %s)',
+                (entry["session"], entry["time"], entry["dst_ip"], entry["dst_port"]))
+
+        elif entry["eventid"] == 'cowrie.direct-tcpip.data':
+            self.simpleQuery(
+                'INSERT INTO `ipforwardsdata` (`session`, `timestamp`, `dst_ip`, `dst_port`, `data`) '
+                'VALUES (%s, FROM_UNIXTIME(%s), %s, %s, %s)',
+                (entry["session"], entry["time"], entry["dst_ip"], entry["dst_port"], entry["data"]))
